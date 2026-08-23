@@ -33,6 +33,7 @@ import ctypes.wintypes as wintypes
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -175,6 +176,28 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 SPOTIPY_REDIRECT_URI = "http://127.0.0.1:8888/callback"
 TOKEN_CACHE_PATH = os.path.join(APP_DIR, ".spotify_token_cache")
 IS_FIRST_RUN = not os.path.exists(TOKEN_CACHE_PATH)  # checked before spotipy has a chance to create it
+
+# Manual per-track lyric sync correction. Community-submitted LRC timing is
+# sometimes consistently off for a specific track (not a matching bug) — this
+# lets the person nudge it into place with the scroll wheel, remembered per
+# song so it only has to be dialed in once.
+SYNC_OFFSETS_PATH = os.path.join(APP_DIR, "sync_offsets.json")
+
+
+def load_sync_offsets():
+    try:
+        with open(SYNC_OFFSETS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_sync_offsets(offsets):
+    try:
+        with open(SYNC_OFFSETS_PATH, "w", encoding="utf-8") as f:
+            json.dump(offsets, f)
+    except Exception:
+        pass
 
 
 def load_config():
@@ -362,6 +385,14 @@ def ease_out_cubic(t):
     return 1 - (1 - t) ** 3
 
 
+class _FakeScrollEvent:
+    """Minimal stand-in so the Linux <Button-4>/<Button-5> scroll handlers
+    can reuse the same code path as Windows/macOS's <MouseWheel>, which
+    carries a real `.delta` attribute those events don't have."""
+    def __init__(self, delta):
+        self.delta = delta
+
+
 class LyricsBanner:
     def __init__(self, root):
         self.root = root
@@ -383,17 +414,27 @@ class LyricsBanner:
         self.highlight_color = "#ffffff"
         root.configure(bg=self.bg_color)
 
-        # Top bar: track caption on the left, close button on the right.
-        # This whole bar (minus the close button) doubles as the drag handle,
-        # since overrideredirect removes the OS title bar we'd normally drag.
+        # Top bar: reset link + track caption on the left, close button on
+        # the right. Everything here except the two buttons doubles as the
+        # drag handle, since overrideredirect removes the OS title bar we'd
+        # normally drag.
         self.top_bar = tk.Frame(root, bg=self.bg_color)
         self.top_bar.pack(fill="x")
+
+        self.reset_button = tk.Label(
+            self.top_bar, text="Reset", font=("Segoe UI", 9, "underline"),
+            fg=self.dim_color, bg=self.bg_color, cursor="hand2"
+        )
+        self.reset_button.pack(side="left", padx=(10, 6), pady=4)
+        self.reset_button.bind("<Button-1>", lambda e: self.perform_reset())
+        self.reset_button.bind("<Enter>", lambda e: self.reset_button.config(fg=self.highlight_color))
+        self.reset_button.bind("<Leave>", lambda e: self.reset_button.config(fg=self.dim_color))
 
         self.track_label = tk.Label(
             self.top_bar, text="", font=("Segoe UI", 9, "bold"),
             fg=self.dim_color, bg=self.bg_color
         )
-        self.track_label.pack(side="left", padx=(10, 0), pady=4)
+        self.track_label.pack(side="left", pady=4)
 
         self.close_button = tk.Label(
             self.top_bar, text="\u2715", font=("Segoe UI", 10, "bold"),
@@ -446,6 +487,15 @@ class LyricsBanner:
         self.lyric_lines = []          # [(seconds, text), ...]
         self.current_index = -1
         self.lyrics_cache = load_lyrics_cache()
+
+        # Manual sync correction (see SYNC_OFFSETS_PATH note above).
+        self.sync_offsets = load_sync_offsets()
+        self.sync_offset_seconds = 0.0
+        self._current_track_display = ""
+        self._sync_feedback_job = None
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)          # Windows/macOS
+        self.root.bind_all("<Button-4>", lambda e: self._on_mousewheel(_FakeScrollEvent(120)))   # Linux scroll up
+        self.root.bind_all("<Button-5>", lambda e: self._on_mousewheel(_FakeScrollEvent(-120)))  # Linux scroll down
 
         # Local playback-position tracking, interpolated between polls.
         self.base_progress_ms = 0
@@ -564,6 +614,34 @@ class LyricsBanner:
         self._unregister_appbar()
         self.root.destroy()
 
+    def perform_reset(self):
+        """Disconnect the currently linked Spotify app/account and restart
+        straight into the first-run setup screen, so the person can link a
+        different Client ID without hunting through AppData folders."""
+        if not messagebox.askyesno(
+            "Reset Spotify link",
+            "This disconnects the linked Spotify app and account. "
+            "You'll be asked to set up a Client ID again on restart. Continue?",
+            parent=self.root,
+        ):
+            return
+
+        for path in (CONFIG_PATH, TOKEN_CACHE_PATH):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass  # best-effort — worst case the setup screen just reuses the old value
+
+        self._unregister_appbar()
+
+        # Relaunch the process fresh rather than trying to tear down and
+        # rebuild the Spotify client/poll thread in place — simpler and
+        # far less error-prone than juggling live thread state.
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
+
     # ---------- layout ----------
 
     def _on_display_resize(self, event):
@@ -593,7 +671,34 @@ class LyricsBanner:
                 self._update_appbar_position()
 
     def set_track_label(self, text):
+        self._current_track_display = text
         self.track_label.config(text=text)
+
+    def load_sync_offset_for_track(self, track_id):
+        """Called when a new track starts, so each song's remembered
+        correction (if any) applies automatically from the first line."""
+        self.sync_offset_seconds = self.sync_offsets.get(track_id, 0.0)
+
+    def _on_mousewheel(self, event):
+        step = 0.25
+        direction = 1 if event.delta > 0 else -1
+        self.sync_offset_seconds = round(self.sync_offset_seconds + direction * step, 2)
+        if self.current_track_id:
+            self.sync_offsets[self.current_track_id] = self.sync_offset_seconds
+            save_sync_offsets(self.sync_offsets)
+        self.current_index = -1  # force the next tick to re-evaluate the current line
+        self._show_sync_feedback()
+
+    def _show_sync_feedback(self):
+        sign = "+" if self.sync_offset_seconds >= 0 else ""
+        self.track_label.config(text=f"Lyrics sync: {sign}{self.sync_offset_seconds:.2f}s  (scroll to adjust)")
+        if self._sync_feedback_job is not None:
+            self.root.after_cancel(self._sync_feedback_job)
+        self._sync_feedback_job = self.root.after(1500, self._restore_track_label)
+
+    def _restore_track_label(self):
+        self._sync_feedback_job = None
+        self.track_label.config(text=self._current_track_display)
 
     def apply_theme(self, bg_hex, dim_hex):
         """Re-tint every widget to match the current track's album art,
@@ -602,6 +707,7 @@ class LyricsBanner:
         self.dim_color = dim_hex
         self.root.configure(bg=bg_hex)
         self.top_bar.configure(bg=bg_hex)
+        self.reset_button.configure(bg=bg_hex, fg=dim_hex)
         self.track_label.configure(bg=bg_hex, fg=dim_hex)
         self.close_button.configure(bg=bg_hex, fg=dim_hex)
         self.resize_grip.configure(bg=bg_hex, fg=dim_hex)
@@ -669,15 +775,20 @@ class LyricsBanner:
     # ---------- playback / seeking ----------
 
     def seek_to(self, seconds):
+        # `seconds` is the lyric's own timestamp (the "effective" timeline,
+        # after any manual sync correction). The real Spotify seek target
+        # is the underlying audio position that offset was applied to.
+        real_audio_seconds = seconds - self.sync_offset_seconds
+
         # Update instantly so the display reflects the click right away,
         # rather than waiting up to 1s for the next poll.
-        self.base_progress_ms = seconds * 1000
+        self.base_progress_ms = real_audio_seconds * 1000
         self.base_timestamp = time.time()
         self.is_playing = True
         self._suppress_correction_until = time.time() + 2.0  # ignore stale polls for 2s
         self.highlight_for_progress(seconds)
         try:
-            sp.seek_track(position_ms=int(seconds * 1000))
+            sp.seek_track(position_ms=int(real_audio_seconds * 1000))
         except Exception as e:
             self.set_track_label(f"Couldn't seek: {e}")
 
@@ -687,7 +798,7 @@ class LyricsBanner:
         once per second when the API responds."""
         if self.is_playing:
             elapsed = time.time() - self.base_timestamp
-            estimated_seconds = (self.base_progress_ms / 1000.0) + elapsed
+            estimated_seconds = (self.base_progress_ms / 1000.0) + elapsed + self.sync_offset_seconds
             self.highlight_for_progress(estimated_seconds)
         self.root.after(200, self._tick)
 
@@ -727,6 +838,21 @@ class LyricsBanner:
                     reported_progress_ms = current.get("progress_ms", 0)
                     corrected_progress_ms = reported_progress_ms + (round_trip / 2) * 1000 if is_playing else reported_progress_ms
 
+                    # Apply this freshly-measured position IMMEDIATELY, before any
+                    # slower work below (like fetching lyrics for a new track,
+                    # which can take seconds on a cache miss). Anchoring it to
+                    # request_finished — the moment we actually received this
+                    # reading — rather than to whatever time.time() happens to
+                    # be after that slower work finishes, is what keeps _tick's
+                    # interpolation accurate instead of silently going stale by
+                    # however long the fetch took. Don't let a poll that was
+                    # already in flight during a manual seek overwrite the
+                    # fresh position with stale data.
+                    if time.time() >= self._suppress_correction_until:
+                        self.base_progress_ms = corrected_progress_ms
+                        self.base_timestamp = request_finished
+                        self.is_playing = is_playing
+
                     if track_id != self.current_track_id:
                         self.current_track_id = track_id
                         name = track["name"]
@@ -734,6 +860,7 @@ class LyricsBanner:
                         primary_artist = track["artists"][0]["name"] if track["artists"] else artist
                         album_name = track.get("album", {}).get("name", "")
                         duration_seconds = track.get("duration_ms", 0) / 1000.0
+                        self.root.after(0, self.load_sync_offset_for_track, track_id)
                         self.root.after(0, self.set_track_label, f"{name} — {artist}")
                         self.root.after(0, self.set_status_message, "Loading lyrics...")
 
@@ -756,13 +883,6 @@ class LyricsBanner:
                                 self.root.after(0, self.set_status_message, "No synced lyrics found.")
                         else:
                             self.root.after(0, self.set_status_message, "No synced lyrics found for this track.")
-
-                    # Don't let a poll that was already in flight during a manual
-                    # seek overwrite the fresh position with stale data.
-                    if time.time() >= self._suppress_correction_until:
-                        self.base_progress_ms = corrected_progress_ms
-                        self.base_timestamp = time.time()
-                        self.is_playing = is_playing
                 else:
                     self.is_playing = False
                     self.root.after(0, self.set_track_label, "Nothing playing")

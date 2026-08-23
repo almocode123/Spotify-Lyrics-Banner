@@ -227,7 +227,7 @@ def prompt_for_client_id(root):
     dialog.configure(bg="#121212")
     dialog.attributes("-topmost", True)
     dialog.resizable(False, False)
-    dialog.geometry("440x340")
+    dialog.geometry("440x400")
     dialog.grab_set()  # modal — blocks interaction with anything else until closed
 
     tk.Label(
@@ -240,8 +240,7 @@ def prompt_for_client_id(root):
         "Takes about 2 minutes, and you'll only ever do this once:\n\n"
         "1.  Open the dashboard using the link below\n"
         "2.  Click \"Create app\" (any name/description is fine)\n"
-        "3.  Add this Redirect URI exactly:\n"
-        "     http://127.0.0.1:8888/callback\n"
+        "3.  Add this Redirect URI exactly (copy it below):\n"
         "4.  Tick \"Web API\", save, then open Settings and\n"
         "     copy the Client ID shown there"
     )
@@ -250,11 +249,36 @@ def prompt_for_client_id(root):
         bg="#121212", justify="left"
     ).pack(padx=20, anchor="w")
 
+    # The redirect URI, shown in a selectable/copyable field with a
+    # one-click Copy button — Spotify requires this to match exactly,
+    # so typing it out by hand is an easy way to introduce a stray
+    # character or use "localhost" instead of "127.0.0.1" by mistake.
+    uri_frame = tk.Frame(dialog, bg="#121212")
+    uri_frame.pack(padx=20, pady=(4, 8), fill="x")
+
+    uri_field = tk.Entry(uri_frame, font=("Consolas", 9), justify="center")
+    uri_field.insert(0, SPOTIPY_REDIRECT_URI)
+    uri_field.config(state="readonly", readonlybackground="#1e1e1e", fg="#1DB954")
+    uri_field.pack(side="left", fill="x", expand=True, ipady=3)
+
+    def copy_uri():
+        dialog.clipboard_clear()
+        dialog.clipboard_append(SPOTIPY_REDIRECT_URI)
+        copy_button.config(text="Copied!")
+        dialog.after(1500, lambda: copy_button.config(text="Copy"))
+
+    copy_button = tk.Button(
+        uri_frame, text="Copy", command=copy_uri,
+        bg="#2a2a2a", fg="white", activebackground="#3a3a3a",
+        font=("Segoe UI", 9), relief="flat", padx=10
+    )
+    copy_button.pack(side="left", padx=(6, 0))
+
     link = tk.Label(
         dialog, text="Open Spotify Developer Dashboard \u2197",
         font=("Segoe UI", 9, "underline"), fg="#1DB954", bg="#121212", cursor="hand2"
     )
-    link.pack(pady=(10, 10))
+    link.pack(pady=(2, 10))
     link.bind("<Button-1>", lambda e: webbrowser.open("https://developer.spotify.com/dashboard"))
 
     entry = tk.Entry(dialog, width=42, font=("Segoe UI", 10))

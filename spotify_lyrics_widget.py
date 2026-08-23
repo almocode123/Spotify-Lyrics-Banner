@@ -124,12 +124,47 @@ def fetch_lyrics_parallel(search_term, timeout=FETCH_TIMEOUT_SECONDS):
     return result
 
 
-def fetch_lyrics_cached(cache, track_id, search_term):
+LRCLIB_GET_ENDPOINT = "https://lrclib.net/api/get"
+
+
+def fetch_lrclib_exact(track_name, artist_name, album_name, duration_seconds, timeout=5):
+    """Ask Lrclib for an EXACT match using Spotify's own track metadata
+    (title, artist, album, duration) rather than a fuzzy text search.
+    This is what actually prevents 'wrong song entirely' — a fuzzy search
+    can match a cover, remix, or live version with a similar title, but
+    those almost never share the exact same duration, so this disambiguates
+    them. Returns None on any mismatch/failure so the caller can fall back
+    to the broader fuzzy search."""
+    try:
+        response = requests.get(
+            LRCLIB_GET_ENDPOINT,
+            params={
+                "track_name": track_name,
+                "artist_name": artist_name,
+                "album_name": album_name,
+                "duration": int(round(duration_seconds)),
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return None  # no sufficiently exact match — let the fuzzy fallback handle it
+        return response.json().get("syncedLyrics")
+    except Exception:
+        return None
+
+
+def fetch_lyrics_cached(cache, track_id, track_name, artist_name, album_name, duration_seconds):
     """Return LRC text (or None) for this track, using the on-disk cache
-    when available so repeat plays skip the network entirely."""
+    when available so repeat plays skip the network entirely. Tries an
+    exact metadata match first (accurate but only covers Lrclib's
+    database), then falls back to the broader fuzzy multi-provider search."""
     if track_id in cache:
         return cache[track_id]
-    lrc = fetch_lyrics_parallel(search_term)
+
+    lrc = fetch_lrclib_exact(track_name, artist_name, album_name, duration_seconds)
+    if not lrc:
+        lrc = fetch_lyrics_parallel(f"{track_name} {artist_name}")
+
     cache[track_id] = lrc  # cache misses too, so a "no lyrics" track doesn't get re-searched every time
     save_lyrics_cache(cache)
     return lrc
@@ -254,6 +289,39 @@ def parse_lrc(lrc_text):
             lines.append((total_seconds, text))
     lines.sort(key=lambda pair: pair[0])
     return lines
+
+
+INSTRUMENTAL_TEXT = "\u266a Instrumental \u266a"
+INSTRUMENTAL_GAP_THRESHOLD = 8   # a gap this long (seconds) with no lyric counts as instrumental
+INSTRUMENTAL_MARKER_DELAY = 3    # show the marker this many seconds into the gap, giving the
+                                  # prior line time to be read rather than switching instantly
+
+
+def inject_instrumental_markers(lines):
+    """Insert synthetic 'Instrumental' entries into gaps between lyric
+    lines (including before the first line, for a long intro) so the
+    banner doesn't sit frozen on stale lyrics through an instrumental
+    break — it explicitly shows there's nothing being sung right now."""
+    if not lines:
+        return lines
+
+    result = []
+
+    if lines[0][0] > INSTRUMENTAL_GAP_THRESHOLD:
+        marker_time = min(INSTRUMENTAL_MARKER_DELAY, lines[0][0] - 1)
+        result.append((marker_time, INSTRUMENTAL_TEXT))
+
+    for i, (seconds, text) in enumerate(lines):
+        result.append((seconds, text))
+        if i + 1 < len(lines):
+            next_seconds = lines[i + 1][0]
+            if next_seconds - seconds > INSTRUMENTAL_GAP_THRESHOLD:
+                marker_time = seconds + INSTRUMENTAL_MARKER_DELAY
+                if marker_time < next_seconds - 1:
+                    result.append((marker_time, INSTRUMENTAL_TEXT))
+
+    result.sort(key=lambda pair: pair[0])
+    return result
 
 
 def get_album_color(image_url):
@@ -663,6 +731,9 @@ class LyricsBanner:
                         self.current_track_id = track_id
                         name = track["name"]
                         artist = ", ".join(a["name"] for a in track["artists"])
+                        primary_artist = track["artists"][0]["name"] if track["artists"] else artist
+                        album_name = track.get("album", {}).get("name", "")
+                        duration_seconds = track.get("duration_ms", 0) / 1000.0
                         self.root.after(0, self.set_track_label, f"{name} — {artist}")
                         self.root.after(0, self.set_status_message, "Loading lyrics...")
 
@@ -673,10 +744,13 @@ class LyricsBanner:
                             bg_hex, dim_hex = build_theme_from_album(image_url)
                             self.root.after(0, self.apply_theme, bg_hex, dim_hex)
 
-                        lrc = fetch_lyrics_cached(self.lyrics_cache, track_id, f"{name} {artist}")
+                        lrc = fetch_lyrics_cached(
+                            self.lyrics_cache, track_id, name, primary_artist, album_name, duration_seconds
+                        )
                         if lrc:
                             parsed = parse_lrc(lrc)
                             if parsed:
+                                parsed = inject_instrumental_markers(parsed)
                                 self.root.after(0, self.build_lines, parsed)
                             else:
                                 self.root.after(0, self.set_status_message, "No synced lyrics found.")

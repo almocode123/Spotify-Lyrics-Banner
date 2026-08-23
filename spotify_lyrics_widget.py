@@ -30,6 +30,8 @@ import sys
 import json
 import ctypes
 import ctypes.wintypes as wintypes
+import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -216,6 +218,105 @@ def save_config(config):
         pass
 
 
+def resolve_icon_path():
+    """Find icon.ico whether running from source (sitting next to this
+    script) or as a frozen PyInstaller exe (which already has the icon
+    embedded in itself, via --icon at build time — no separate file needed)."""
+    if getattr(sys, "frozen", False):
+        return None  # the running exe's own icon is used directly instead
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    return candidate if os.path.exists(candidate) else None
+
+
+def create_desktop_shortcut():
+    """Best-effort: create a Windows desktop shortcut that relaunches this
+    app, with our icon. Uses PowerShell's WScript.Shell COM object rather
+    than a pip dependency like pywin32, since PowerShell already ships with
+    Windows.
+
+    Two things this deliberately gets right that a naive version wouldn't:
+    - The real Desktop folder is asked FROM WINDOWS ITSELF (via
+      WScript.Shell's SpecialFolders), not assumed to be
+      %USERPROFILE%\\Desktop — that assumption breaks silently on the many
+      machines where OneDrive has redirected the visible Desktop elsewhere,
+      which looks exactly like "the shortcut wasn't created" even though a
+      file did get written, just somewhere the user never sees it.
+    - Values are passed as separate script ARGUMENTS (via a temp .ps1 file),
+      not interpolated into one long quoted string — a path or username
+      containing an apostrophe would otherwise break naive single-quoted
+      PowerShell string building.
+
+    Returns (success, error_message_or_None).
+    """
+    if not IS_WINDOWS:
+        return False, "Not running on Windows."
+
+    script_path = None
+    try:
+        if getattr(sys, "frozen", False):
+            target = sys.executable            # the exe itself — already has our icon embedded
+            arguments = ""
+            icon_location = f"{target},0"
+            working_dir = os.path.dirname(target)
+        else:
+            target = sys.executable            # python.exe
+            source_path = os.path.abspath(__file__)
+            arguments = f'"{source_path}"'
+            icon_path = resolve_icon_path()
+            icon_location = f"{icon_path},0" if icon_path else f"{target},0"
+            working_dir = os.path.dirname(source_path)
+
+        powershell_script = (
+            "param([string]$Name,[string]$TargetPath,[string]$Arguments,"
+            "[string]$IconLocation,[string]$WorkingDirectory)\n"
+            "$WshShell = New-Object -ComObject WScript.Shell\n"
+            "$DesktopPath = $WshShell.SpecialFolders('Desktop')\n"  # respects OneDrive redirection etc.
+            "$ShortcutPath = Join-Path $DesktopPath $Name\n"
+            "$Shortcut = $WshShell.CreateShortcut($ShortcutPath)\n"
+            "$Shortcut.TargetPath = $TargetPath\n"
+            "$Shortcut.Arguments = $Arguments\n"
+            "$Shortcut.IconLocation = $IconLocation\n"
+            "$Shortcut.WorkingDirectory = $WorkingDirectory\n"
+            "$Shortcut.Save()\n"
+            "Write-Output $ShortcutPath\n"
+        )
+
+        fd, script_path = tempfile.mkstemp(suffix=".ps1")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(powershell_script)
+
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", script_path,
+                "-Name", "Spotify Lyrics Banner.lnk",
+                "-TargetPath", target,
+                "-Arguments", arguments,
+                "-IconLocation", icon_location,
+                "-WorkingDirectory", working_dir,
+            ],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        if result.returncode != 0:
+            return False, (result.stderr or "PowerShell returned a non-zero exit code").strip()
+
+        created_path = result.stdout.strip()
+        if not created_path or not os.path.exists(created_path):
+            return False, "PowerShell reported success, but no shortcut file was found afterward."
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if script_path:
+            try:
+                os.remove(script_path)
+            except Exception:
+                pass
+
+
 def prompt_for_client_id(root):
     """Blocking first-run setup screen: collects and saves a Spotify Client
     ID so the person never has to open or edit the source code. Returns the
@@ -227,7 +328,7 @@ def prompt_for_client_id(root):
     dialog.configure(bg="#121212")
     dialog.attributes("-topmost", True)
     dialog.resizable(False, False)
-    dialog.geometry("440x400")
+    dialog.geometry("440x420")
     dialog.grab_set()  # modal — blocks interaction with anything else until closed
 
     tk.Label(
@@ -285,6 +386,16 @@ def prompt_for_client_id(root):
     entry.pack(pady=(0, 6))
     entry.focus_set()
 
+    shortcut_var = tk.BooleanVar(value=True)
+    if IS_WINDOWS:
+        shortcut_check = tk.Checkbutton(
+            dialog, text="Create a desktop shortcut", variable=shortcut_var,
+            fg="#cccccc", bg="#121212", selectcolor="#1e1e1e",
+            activebackground="#121212", activeforeground="#cccccc",
+            font=("Segoe UI", 9)
+        )
+        shortcut_check.pack(pady=(2, 0))
+
     error_label = tk.Label(dialog, text="", font=("Segoe UI", 8), fg="#ff6b6b", bg="#121212")
     error_label.pack()
 
@@ -293,6 +404,15 @@ def prompt_for_client_id(root):
         if not value:
             error_label.config(text="Paste your Client ID before continuing.")
             return
+        if IS_WINDOWS and shortcut_var.get():
+            success, error = create_desktop_shortcut()
+            if not success:
+                messagebox.showwarning(
+                    "Desktop shortcut",
+                    f"Couldn't create the desktop shortcut:\n{error}\n\n"
+                    "You can try again anytime from the Reset button.",
+                    parent=dialog,
+                )
         result["client_id"] = value
         dialog.destroy()
 
@@ -418,6 +538,7 @@ class _FakeScrollEvent:
 
 
 class LyricsBanner:
+
     def __init__(self, root):
         self.root = root
         root.title("Lyrics")
@@ -528,6 +649,7 @@ class LyricsBanner:
         self._suppress_correction_until = 0.0
 
         self._appbar_registered = False
+        self._appbar_updating = False  # reentrancy guard, see _update_appbar_position
         self._hwnd = None
 
         if IS_FIRST_RUN:
@@ -581,7 +703,18 @@ class LyricsBanner:
     # ---------- reserved screen space (Windows AppBar) ----------
 
     def _register_appbar(self):
+        """Reserve a strip at the top so maximized windows sit below the
+        banner instead of underneath it.
+
+        Known trade-off, enabled deliberately: reserving work area is the
+        same OS-level value the shell uses to lay out desktop icons, so
+        while the banner is docked Windows may reflow the desktop icon
+        grid. There is no way to get the window behaviour without that —
+        it's one shared number. Set "reserve_space": false in config.json
+        to turn this off and accept window overlap instead."""
         if not IS_WINDOWS:
+            return
+        if not load_config().get("reserve_space", True):
             return
         try:
             self._hwnd = self.root.winfo_id()
@@ -597,27 +730,51 @@ class LyricsBanner:
 
     def _update_appbar_position(self):
         """Tell Windows to reserve a full-width strip at the top matching
-        our current height, and snap our own window to whatever rect
-        Windows actually grants (it may be adjusted if something else,
-        like the real taskbar, is also docked at that edge)."""
-        if not self._appbar_registered:
+        our current height, and snap our own window to that rect.
+
+        Guarded against reentrancy: this calls root.geometry(), which fires
+        a <Configure> event, which routes back into _fit_window_height() and
+        would call this again. Without the guard that loop re-reserves space
+        on every pass and the reserved strip creeps down the screen, eating
+        the desktop work area (and collapsing the desktop icon grid with it)."""
+        if not self._appbar_registered or self._appbar_updating:
             return
+        self._appbar_updating = True
         try:
             screen_w = self.root.winfo_screenwidth()
-            height = self.root.winfo_height()
+            screen_h = self.root.winfo_screenheight()
+            # Hard safety clamp — a banner should never reserve more than a
+            # small slice of the screen no matter what height calculation
+            # upstream produces.
+            max_reserved = max(40, int(screen_h * 0.20))
+            height = min(max(self.root.winfo_height(), self._min_height), max_reserved)
+
             abd = APPBARDATA()
             abd.cbSize = ctypes.sizeof(APPBARDATA)
             abd.hWnd = self._hwnd
             abd.uEdge = ABE_TOP
             abd.rc = RECT(0, 0, screen_w, height)
             ctypes.windll.shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd))
-            abd.rc.bottom = abd.rc.top + height  # keep our chosen thickness
+
+            # Always re-anchor to the very top edge and full screen width.
+            # Using whatever rect QUERYPOS hands back verbatim is what let the
+            # strip drift downward and accumulate on each successive call.
+            abd.rc.left = 0
+            abd.rc.right = screen_w
+            abd.rc.top = 0
+            abd.rc.bottom = height
+
             ctypes.windll.shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
-            w = abd.rc.right - abd.rc.left
-            h = abd.rc.bottom - abd.rc.top
-            self.root.geometry(f"{w}x{h}+{abd.rc.left}+{abd.rc.top}")
+            self.root.geometry(f"{screen_w}x{height}+0+0")
         except Exception as e:
             self.set_track_label(f"Couldn't update reserved space: {e}")
+        finally:
+            # Release the guard only after Tk has processed the geometry
+            # change, so the resulting <Configure> can't re-enter this.
+            self.root.after(50, self._clear_appbar_updating)
+
+    def _clear_appbar_updating(self):
+        self._appbar_updating = False
 
     def _unregister_appbar(self):
         if not self._appbar_registered:
@@ -658,6 +815,17 @@ class LyricsBanner:
             except Exception:
                 pass  # best-effort — worst case the setup screen just reuses the old value
 
+        # Unconditional, not gated behind the setup screen's checkbox — this
+        # is specifically so someone who's had the app since before that
+        # checkbox existed still gets a shortcut once they reset.
+        success, error = create_desktop_shortcut()
+        if not success:
+            messagebox.showwarning(
+                "Desktop shortcut",
+                f"Couldn't create the desktop shortcut:\n{error}",
+                parent=self.root,
+            )
+
         self._unregister_appbar()
 
         # Relaunch the process fresh rather than trying to tear down and
@@ -682,6 +850,8 @@ class LyricsBanner:
         the displayed line (or its wrapping) changes."""
         if self.active_label is None:
             return
+        if self._appbar_updating:
+            return  # an appbar reposition is mid-flight; don't fight it
         self.root.update_idletasks()
         top_h = self.top_bar.winfo_reqheight()
         content_h = self.active_label.winfo_reqheight()
@@ -690,9 +860,14 @@ class LyricsBanner:
         current_w = self.root.winfo_width()
         current_h = self.root.winfo_height()
         if abs(target_h - current_h) > 2:
-            self.root.geometry(f"{current_w}x{target_h}")
             if self._appbar_registered:
+                # While docked, the appbar owns our geometry — set the height
+                # then let the appbar path apply it, rather than both issuing
+                # competing geometry() calls.
+                self.root.geometry(f"{current_w}x{target_h}")
                 self._update_appbar_position()
+            else:
+                self.root.geometry(f"{current_w}x{target_h}")
 
     def set_track_label(self, text):
         self._current_track_display = text

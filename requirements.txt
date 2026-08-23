@@ -1,4 +1,0 @@
-spotipy
-syncedlyrics
-pillow
-requests

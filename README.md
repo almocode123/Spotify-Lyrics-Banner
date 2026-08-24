@@ -1,5 +1,7 @@
 # Spotify Lyrics Banner
 
+<img width="1763" height="246" alt="Image" src="https://github.com/user-attachments/assets/dc3d0b6e-bb9a-4ad8-86f1-fe3fb2ae477c" />
+
 A thin, movable, resizable banner that pins to the top of your screen and shows
 time-synced lyrics for whatever's currently playing on Spotify — one line at a
 time, sliding in like a slot-machine reel, tinted to match the track's album art.
